@@ -7,15 +7,25 @@ from pathlib import Path
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend
 from deepagents.backends.filesystem import FilesystemBackend
-from deepagents.middleware.resumable_shell import ResumableShellToolMiddleware
-from langchain.agents.middleware import HostExecutionPolicy, InterruptOnConfig
+from deepagents.backends.sandbox import SandboxBackendProtocol
+from langchain.agents.middleware import (
+    HostExecutionPolicy,
+    InterruptOnConfig,
+)
+from langchain.agents.middleware.types import AgentState
+from langchain.messages import ToolCall
+from langchain.tools import BaseTool
+from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.pregel import Pregel
+from langgraph.runtime import Runtime
 
-from .agent_memory import AgentMemoryMiddleware
-from .config import COLORS, config, console, get_default_coding_instructions
+from deepagents_cli._internal import ResumableShellToolMiddleware
+from deepagents_cli.agent_memory import AgentMemoryMiddleware
+from deepagents_cli.config import COLORS, config, console, get_default_coding_instructions
 
 
-def list_agents():
+def list_agents() -> None:
     """List all available agents."""
     agents_dir = Path.home() / ".deepagents"
 
@@ -46,7 +56,7 @@ def list_agents():
     console.print()
 
 
-def reset_agent(agent_name: str, source_agent: str = None):
+def reset_agent(agent_name: str, source_agent: str | None = None) -> None:
     """Reset an agent to default or copy from another agent."""
     agents_dir = Path.home() / ".deepagents"
     agent_dir = agents_dir / agent_name
@@ -79,17 +89,44 @@ def reset_agent(agent_name: str, source_agent: str = None):
     console.print(f"Location: {agent_dir}\n", style=COLORS["dim"])
 
 
-def get_system_prompt() -> str:
+def get_system_prompt(sandbox_type: str | None = None) -> str:
     """Get the base system prompt for the agent.
+
+    Args:
+        sandbox_type: Type of sandbox provider ("modal", "runloop", "daytona").
+                     If None, agent is operating in local mode.
 
     Returns:
         The system prompt string (without agent.md content)
     """
-    return f"""### Current Working Directory
+    if sandbox_type:
+        # Get provider-specific working directory
+        from deepagents_cli.integrations.sandbox_factory import get_default_working_dir
+
+        working_dir = get_default_working_dir(sandbox_type)
+
+        working_dir_section = f"""### Current Working Directory
+
+You are operating in a **remote Linux sandbox** at `{working_dir}`.
+
+All code execution and file operations happen in this sandbox environment.
+
+**Important:**
+- The CLI is running locally on the user's machine, but you execute code remotely
+- Use `{working_dir}` as your working directory for all operations
+- The local `/memories/` directory is still accessible for persistent storage
+
+"""
+    else:
+        working_dir_section = f"""### Current Working Directory
 
 The filesystem backend is currently operating in: `{Path.cwd()}`
 
-### Memory System Reminder
+"""
+
+    return (
+        working_dir_section
+        + """### Memory System Reminder
 
 Your long-term memory is stored in /memories/ and persists across sessions.
 
@@ -136,15 +173,108 @@ When using the write_todos tool:
 6. Update todo status promptly as you complete each item
 
 The todo list is a planning tool - use it judiciously to avoid overwhelming the user with excessive task tracking."""
-
-
-def create_agent_with_config(model, assistant_id: str, tools: list):
-    """Create and configure an agent with the specified model and tools."""
-    shell_middleware = ResumableShellToolMiddleware(
-        workspace_root=os.getcwd(), execution_policy=HostExecutionPolicy()
     )
 
-    # For long-term memory, point to ~/.deepagents/AGENT_NAME/ with /memories/ prefix
+
+def _format_write_file_description(tool_call: ToolCall, state: AgentState, runtime: Runtime) -> str:
+    """Format write_file tool call for approval prompt."""
+    args = tool_call["args"]
+    file_path = args.get("file_path", "unknown")
+    content = args.get("content", "")
+
+    action = "Overwrite" if os.path.exists(file_path) else "Create"
+    line_count = len(content.splitlines())
+
+    return f"File: {file_path}\nAction: {action} file\nLines: {line_count}"
+
+
+def _format_edit_file_description(tool_call: ToolCall, state: AgentState, runtime: Runtime) -> str:
+    """Format edit_file tool call for approval prompt."""
+    args = tool_call["args"]
+    file_path = args.get("file_path", "unknown")
+    replace_all = bool(args.get("replace_all", False))
+
+    return (
+        f"File: {file_path}\n"
+        f"Action: Replace text ({'all occurrences' if replace_all else 'single occurrence'})"
+    )
+
+
+def _format_web_search_description(tool_call: ToolCall, state: AgentState, runtime: Runtime) -> str:
+    """Format web_search tool call for approval prompt."""
+    args = tool_call["args"]
+    query = args.get("query", "unknown")
+    max_results = args.get("max_results", 5)
+
+    return f"Query: {query}\nMax results: {max_results}\n\n⚠️  This will use Tavily API credits"
+
+
+def _format_fetch_url_description(tool_call: ToolCall, state: AgentState, runtime: Runtime) -> str:
+    """Format fetch_url tool call for approval prompt."""
+    args = tool_call["args"]
+    url = args.get("url", "unknown")
+    timeout = args.get("timeout", 30)
+
+    return f"URL: {url}\nTimeout: {timeout}s\n\n⚠️  Will fetch and convert web content to markdown"
+
+
+def _format_task_description(tool_call: ToolCall, state: AgentState, runtime: Runtime) -> str:
+    """Format task (subagent) tool call for approval prompt."""
+    args = tool_call["args"]
+    description = args.get("description", "unknown")
+    prompt = args.get("prompt", "")
+
+    # Truncate prompt if too long
+    prompt_preview = prompt[:300]
+    if len(prompt) > 300:
+        prompt_preview += "..."
+
+    return (
+        f"Task: {description}\n\n"
+        f"Instructions to subagent:\n"
+        f"{'─' * 40}\n"
+        f"{prompt_preview}\n"
+        f"{'─' * 40}\n\n"
+        f"⚠️  Subagent will have access to file operations and shell commands"
+    )
+
+
+def _format_shell_description(tool_call: ToolCall, state: AgentState, runtime: Runtime) -> str:
+    """Format shell tool call for approval prompt."""
+    args = tool_call["args"]
+    command = args.get("command", "N/A")
+    return f"Shell Command: {command}\nWorking Directory: {os.getcwd()}"
+
+
+def _format_execute_description(tool_call: ToolCall, state: AgentState, runtime: Runtime) -> str:
+    """Format execute tool call for approval prompt."""
+    args = tool_call["args"]
+    command = args.get("command", "N/A")
+    return f"Execute Command: {command}\nLocation: Remote Sandbox"
+
+
+def create_agent_with_config(
+    model: str | BaseChatModel,
+    assistant_id: str,
+    tools: list[BaseTool],
+    *,
+    sandbox: SandboxBackendProtocol | None = None,
+    sandbox_type: str | None = None,
+) -> tuple[Pregel, CompositeBackend]:
+    """Create and configure an agent with the specified model and tools.
+
+    Args:
+        model: LLM model to use
+        assistant_id: Agent identifier for memory storage
+        tools: Additional tools to provide to agent
+        sandbox: Optional sandbox backend for remote execution (e.g., ModalBackend).
+                 If None, uses local filesystem + shell.
+        sandbox_type: Type of sandbox provider ("modal", "runloop", "daytona")
+
+    Returns:
+        2-tuple of graph and backend
+    """
+    # Setup agent directory for persistent memory (same for both local and remote modes)
     agent_dir = Path.home() / ".deepagents" / assistant_id
     agent_dir.mkdir(parents=True, exist_ok=True)
     agent_md = agent_dir / "agent.md"
@@ -152,119 +282,98 @@ def create_agent_with_config(model, assistant_id: str, tools: list):
         source_content = get_default_coding_instructions()
         agent_md.write_text(source_content)
 
-    # Long-term backend - rooted at agent directory
-    # This handles both /memories/ files and /agent.md
+    # Long-term backend for /memories/ route (always local, persists across sessions)
     long_term_backend = FilesystemBackend(root_dir=agent_dir, virtual_mode=True)
 
-    # Composite backend: current working directory for default, agent directory for /memories/
-    backend = CompositeBackend(
-        default=FilesystemBackend(), routes={"/memories/": long_term_backend}
-    )
-
-    # Use the same backend for agent memory middleware
-    agent_middleware = [
-        AgentMemoryMiddleware(backend=long_term_backend, memory_path="/memories/"),
-        shell_middleware,
-    ]
-
-    # Get the system prompt
-    system_prompt = get_system_prompt()
-
-    # Helper functions for formatting tool descriptions in HITL prompts
-    def format_write_file_description(tool_call: dict) -> str:
-        """Format write_file tool call for approval prompt."""
-        args = tool_call.get("args", {})
-        file_path = args.get("file_path", "unknown")
-        content = args.get("content", "")
-
-        action = "Overwrite" if os.path.exists(file_path) else "Create"
-        line_count = len(content.splitlines())
-
-        return f"File: {file_path}\nAction: {action} file\nLines: {line_count}"
-
-    def format_edit_file_description(tool_call: dict) -> str:
-        """Format edit_file tool call for approval prompt."""
-        args = tool_call.get("args", {})
-        file_path = args.get("file_path", "unknown")
-        replace_all = bool(args.get("replace_all", False))
-
-        return (
-            f"File: {file_path}\n"
-            f"Action: Replace text ({'all occurrences' if replace_all else 'single occurrence'})"
+    # CONDITIONAL SETUP: Local vs Remote Sandbox
+    if sandbox is None:
+        # ========== LOCAL MODE (current behavior) ==========
+        # Backend: Local filesystem for code + local /memories/
+        composite_backend = CompositeBackend(
+            default=FilesystemBackend(),  # Current working directory
+            routes={"/memories/": long_term_backend},  # Agent memories
         )
 
-    def format_web_search_description(tool_call: dict) -> str:
-        """Format web_search tool call for approval prompt."""
-        args = tool_call.get("args", {})
-        query = args.get("query", "unknown")
-        max_results = args.get("max_results", 5)
-
-        return f"Query: {query}\nMax results: {max_results}\n\n⚠️  This will use Tavily API credits"
-
-    def format_task_description(tool_call: dict) -> str:
-        """Format task (subagent) tool call for approval prompt."""
-        args = tool_call.get("args", {})
-        description = args.get("description", "unknown")
-        prompt = args.get("prompt", "")
-
-        # Truncate prompt if too long
-        prompt_preview = prompt[:300]
-        if len(prompt) > 300:
-            prompt_preview += "..."
-
-        return (
-            f"Task: {description}\n\n"
-            f"Instructions to subagent:\n"
-            f"{'─' * 40}\n"
-            f"{prompt_preview}\n"
-            f"{'─' * 40}\n\n"
-            f"⚠️  Subagent will have access to file operations and shell commands"
+        # Middleware: ResumableShellToolMiddleware provides "shell" tool
+        agent_middleware = [
+            AgentMemoryMiddleware(backend=long_term_backend, memory_path="/memories/"),
+            ResumableShellToolMiddleware(
+                workspace_root=os.getcwd(), execution_policy=HostExecutionPolicy()
+            ),
+        ]
+    else:
+        # ========== REMOTE SANDBOX MODE ==========
+        # Backend: Remote sandbox for code + local /memories/
+        composite_backend = CompositeBackend(
+            default=sandbox,  # Remote sandbox (ModalBackend, etc.)
+            routes={"/memories/": long_term_backend},  # Agent memories (still local!)
         )
+
+        # Middleware: create_deep_agent automatically provides file tools + execute
+        # when a SandboxBackend is passed, so we only add AgentMemoryMiddleware
+        agent_middleware = [
+            AgentMemoryMiddleware(backend=long_term_backend, memory_path="/memories/"),
+        ]
+        # NOTE: File operations (ls, read, write, edit, glob, grep) and execute tool
+        # are automatically provided by create_deep_agent when backend is a SandboxBackend.
+        # No need to add FilesystemMiddleware or ShellToolMiddleware manually.
+
+    # Get the system prompt (sandbox-aware)
+    system_prompt = get_system_prompt(sandbox_type=sandbox_type)
 
     # Configure human-in-the-loop for potentially destructive tools
     shell_interrupt_config: InterruptOnConfig = {
         "allowed_decisions": ["approve", "reject"],
-        "description": lambda tool_call, state, runtime: (
-            f"Shell Command: {tool_call['args'].get('command', 'N/A')}\n"
-            f"Working Directory: {os.getcwd()}"
-        ),
+        "description": _format_shell_description,
+    }
+
+    execute_interrupt_config: InterruptOnConfig = {
+        "allowed_decisions": ["approve", "reject"],
+        "description": _format_execute_description,
     }
 
     write_file_interrupt_config: InterruptOnConfig = {
         "allowed_decisions": ["approve", "reject"],
-        "description": lambda tool_call, state, runtime: format_write_file_description(tool_call),
+        "description": _format_write_file_description,
     }
 
     edit_file_interrupt_config: InterruptOnConfig = {
         "allowed_decisions": ["approve", "reject"],
-        "description": lambda tool_call, state, runtime: format_edit_file_description(tool_call),
+        "description": _format_edit_file_description,
     }
 
     web_search_interrupt_config: InterruptOnConfig = {
         "allowed_decisions": ["approve", "reject"],
-        "description": lambda tool_call, state, runtime: format_web_search_description(tool_call),
+        "description": _format_web_search_description,
+    }
+
+    fetch_url_interrupt_config: InterruptOnConfig = {
+        "allowed_decisions": ["approve", "reject"],
+        "description": _format_fetch_url_description,
     }
 
     task_interrupt_config: InterruptOnConfig = {
         "allowed_decisions": ["approve", "reject"],
-        "description": lambda tool_call, state, runtime: format_task_description(tool_call),
+        "description": _format_task_description,
     }
 
     agent = create_deep_agent(
         model=model,
         system_prompt=system_prompt,
         tools=tools,
-        backend=backend,
+        backend=composite_backend,
         middleware=agent_middleware,
         interrupt_on={
             "shell": shell_interrupt_config,
+            "execute": execute_interrupt_config,
             "write_file": write_file_interrupt_config,
             "edit_file": edit_file_interrupt_config,
             "web_search": web_search_interrupt_config,
+            "fetch_url": fetch_url_interrupt_config,
             "task": task_interrupt_config,
         },
     ).with_config(config)
 
     agent.checkpointer = InMemorySaver()
 
-    return agent
+    return agent, composite_backend
