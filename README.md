@@ -164,7 +164,7 @@ agent = create_deep_agent(
 ```
 
 ### `middleware`
-`create_deep_agent` is implemented with middleware that can be customized. You can provide additional middleware to extend functionality, add tools, or implement custom hooks. 
+`create_deep_agent` is implemented with middleware that can be customized. You can provide additional middleware to extend functionality, add tools, or implement custom hooks.
 
 ```python
 from langchain_core.tools import tool
@@ -189,6 +189,46 @@ agent = create_deep_agent(
     middleware=[WeatherMiddleware()]
 )
 ```
+
+### `disable_default_middleware`
+
+By default, `create_deep_agent` includes several middleware that provide core functionality (planning, filesystem tools, subagents, etc.). You can selectively disable these default middleware using the `disable_default_middleware` parameter.
+
+**Options:**
+- `False` (default): Enable all default middleware
+- `True`: Disable all default middleware
+- A set or list of strings: Disable specific middleware by name
+
+**Available middleware names:**
+- `"todo_list"` - TodoListMiddleware (planning tool)
+- `"filesystem"` - FilesystemMiddleware (file system tools)
+- `"subagents"` - SubAgentMiddleware (subagent spawning)
+- `"summarization"` - SummarizationMiddleware (context management)
+- `"prompt_caching"` - AnthropicPromptCachingMiddleware (prompt caching)
+- `"patch_tool_calls"` - PatchToolCallsMiddleware (tool call patching)
+
+```python
+from deepagents import create_deep_agent
+
+# Disable all default middleware
+agent = create_deep_agent(
+    disable_default_middleware=True,
+    tools=[my_custom_tool]
+)
+
+# Disable only specific middleware
+agent = create_deep_agent(
+    disable_default_middleware={"todo_list", "filesystem"},
+    tools=[my_custom_tool]
+)
+
+# Disable filesystem but keep other middleware
+agent = create_deep_agent(
+    disable_default_middleware=["filesystem"]
+)
+```
+
+This is useful when you want to build a more minimal agent or replace default functionality with your own custom middleware.
 
 ### `subagents`
 

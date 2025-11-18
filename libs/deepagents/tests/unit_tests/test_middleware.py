@@ -1083,3 +1083,149 @@ class TestTruncation:
         # Should end with truncation message
         assert "results truncated" in result
         assert "try being more specific" in result
+
+
+class TestDisableDefaultMiddleware:
+    """Tests for the disable_default_middleware parameter in create_deep_agent."""
+
+    def test_default_all_middleware_enabled(self):
+        """Test that by default (disable_default_middleware=False), all middleware are enabled."""
+        from deepagents import create_deep_agent
+
+        agent = create_deep_agent()
+        agent_tools = agent.nodes["tools"].bound._tools_by_name.keys()
+
+        # TodoListMiddleware tool
+        assert "write_todos" in agent_tools
+
+        # FilesystemMiddleware tools
+        assert "ls" in agent_tools
+        assert "read_file" in agent_tools
+        assert "write_file" in agent_tools
+        assert "edit_file" in agent_tools
+        assert "glob" in agent_tools
+        assert "grep" in agent_tools
+
+        # SubAgentMiddleware tool
+        assert "task" in agent_tools
+
+    def test_disable_all_middleware(self):
+        """Test that disable_default_middleware=True disables all default middleware."""
+        from deepagents import create_deep_agent
+
+        agent = create_deep_agent(disable_default_middleware=True)
+        agent_tools = agent.nodes["tools"].bound._tools_by_name.keys()
+
+        # All default middleware tools should be absent
+        assert "write_todos" not in agent_tools
+        assert "ls" not in agent_tools
+        assert "read_file" not in agent_tools
+        assert "write_file" not in agent_tools
+        assert "edit_file" not in agent_tools
+        assert "glob" not in agent_tools
+        assert "grep" not in agent_tools
+        assert "task" not in agent_tools
+
+    def test_disable_specific_middleware_todo_list(self):
+        """Test disabling only the todo_list middleware."""
+        from deepagents import create_deep_agent
+
+        agent = create_deep_agent(disable_default_middleware={"todo_list"})
+        agent_tools = agent.nodes["tools"].bound._tools_by_name.keys()
+
+        # TodoListMiddleware tool should be absent
+        assert "write_todos" not in agent_tools
+
+        # Other middleware tools should be present
+        assert "ls" in agent_tools
+        assert "task" in agent_tools
+
+    def test_disable_specific_middleware_filesystem(self):
+        """Test disabling only the filesystem middleware."""
+        from deepagents import create_deep_agent
+
+        agent = create_deep_agent(disable_default_middleware={"filesystem"})
+        agent_tools = agent.nodes["tools"].bound._tools_by_name.keys()
+
+        # FilesystemMiddleware tools should be absent
+        assert "ls" not in agent_tools
+        assert "read_file" not in agent_tools
+        assert "write_file" not in agent_tools
+        assert "edit_file" not in agent_tools
+        assert "glob" not in agent_tools
+        assert "grep" not in agent_tools
+
+        # Other middleware tools should be present
+        assert "write_todos" in agent_tools
+        assert "task" in agent_tools
+
+    def test_disable_specific_middleware_subagents(self):
+        """Test disabling only the subagents middleware."""
+        from deepagents import create_deep_agent
+
+        agent = create_deep_agent(disable_default_middleware={"subagents"})
+        agent_tools = agent.nodes["tools"].bound._tools_by_name.keys()
+
+        # SubAgentMiddleware tool should be absent
+        assert "task" not in agent_tools
+
+        # Other middleware tools should be present
+        assert "write_todos" in agent_tools
+        assert "ls" in agent_tools
+
+    def test_disable_multiple_middleware(self):
+        """Test disabling multiple middleware at once."""
+        from deepagents import create_deep_agent
+
+        agent = create_deep_agent(disable_default_middleware={"todo_list", "filesystem"})
+        agent_tools = agent.nodes["tools"].bound._tools_by_name.keys()
+
+        # Disabled middleware tools should be absent
+        assert "write_todos" not in agent_tools
+        assert "ls" not in agent_tools
+        assert "read_file" not in agent_tools
+
+        # Enabled middleware tools should be present
+        assert "task" in agent_tools
+
+    def test_disable_middleware_with_list(self):
+        """Test that disable_default_middleware works with a list as well as a set."""
+        from deepagents import create_deep_agent
+
+        agent = create_deep_agent(disable_default_middleware=["todo_list", "filesystem"])
+        agent_tools = agent.nodes["tools"].bound._tools_by_name.keys()
+
+        # Disabled middleware tools should be absent
+        assert "write_todos" not in agent_tools
+        assert "ls" not in agent_tools
+
+        # Enabled middleware tools should be present
+        assert "task" in agent_tools
+
+    def test_disable_middleware_with_custom_middleware(self):
+        """Test that custom middleware still works when default middleware are disabled."""
+        from langchain.agents.middleware import AgentMiddleware
+        from langchain_core.tools import tool
+
+        @tool
+        def custom_tool():
+            """A custom tool"""
+            return "custom result"
+
+        class CustomMiddleware(AgentMiddleware):
+            tools = [custom_tool]
+
+        from deepagents import create_deep_agent
+
+        agent = create_deep_agent(
+            disable_default_middleware=True, middleware=[CustomMiddleware()]
+        )
+        agent_tools = agent.nodes["tools"].bound._tools_by_name.keys()
+
+        # Default middleware tools should be absent
+        assert "write_todos" not in agent_tools
+        assert "ls" not in agent_tools
+        assert "task" not in agent_tools
+
+        # Custom middleware tool should be present
+        assert "custom_tool" in agent_tools

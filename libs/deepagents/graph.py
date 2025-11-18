@@ -50,6 +50,7 @@ def create_deep_agent(
     store: BaseStore | None = None,
     backend: BackendProtocol | BackendFactory | None = None,
     interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
+    disable_default_middleware: bool | set[str] | list[str] = False,
     debug: bool = False,
     name: str | None = None,
     cache: BaseCache | None = None,
@@ -84,6 +85,12 @@ def create_deep_agent(
             callable factory like `lambda rt: StateBackend(rt)`.
         interrupt_on: Optional Dict[str, bool | InterruptOnConfig] mapping tool names to
             interrupt configs.
+        disable_default_middleware: Controls which default middleware to disable.
+            - False (default): Enable all default middleware
+            - True: Disable all default middleware
+            - set/list of strings: Disable specific middleware by name
+              Available names: "todo_list", "filesystem", "subagents",
+              "summarization", "prompt_caching", "patch_tool_calls"
         debug: Whether to enable debug mode. Passed through to create_agent.
         name: The name of the agent. Passed through to create_agent.
         cache: The cache to use for the agent. Passed through to create_agent.
@@ -94,35 +101,72 @@ def create_deep_agent(
     if model is None:
         model = get_default_model()
 
-    deepagent_middleware = [
-        TodoListMiddleware(),
-        FilesystemMiddleware(backend=backend),
-        SubAgentMiddleware(
-            default_model=model,
-            default_tools=tools,
-            subagents=subagents if subagents is not None else [],
-            default_middleware=[
-                TodoListMiddleware(),
-                FilesystemMiddleware(backend=backend),
+    # Convert disable_default_middleware to a set for easier checking
+    if disable_default_middleware is True:
+        disabled = {"todo_list", "filesystem", "subagents", "summarization", "prompt_caching", "patch_tool_calls"}
+    elif disable_default_middleware is False:
+        disabled = set()
+    else:
+        disabled = set(disable_default_middleware)
+
+    # Build middleware list conditionally
+    deepagent_middleware = []
+
+    if "todo_list" not in disabled:
+        deepagent_middleware.append(TodoListMiddleware())
+
+    if "filesystem" not in disabled:
+        deepagent_middleware.append(FilesystemMiddleware(backend=backend))
+
+    if "subagents" not in disabled:
+        # Build subagent default middleware based on disabled set
+        subagent_default_middleware = []
+        if "todo_list" not in disabled:
+            subagent_default_middleware.append(TodoListMiddleware())
+        if "filesystem" not in disabled:
+            subagent_default_middleware.append(FilesystemMiddleware(backend=backend))
+        if "summarization" not in disabled:
+            subagent_default_middleware.append(
                 SummarizationMiddleware(
                     model=model,
                     max_tokens_before_summary=170000,
                     messages_to_keep=6,
-                ),
-                AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
-                PatchToolCallsMiddleware(),
-            ],
-            default_interrupt_on=interrupt_on,
-            general_purpose_agent=True,
-        ),
-        SummarizationMiddleware(
-            model=model,
-            max_tokens_before_summary=170000,
-            messages_to_keep=6,
-        ),
-        AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
-        PatchToolCallsMiddleware(),
-    ]
+                )
+            )
+        if "prompt_caching" not in disabled:
+            subagent_default_middleware.append(
+                AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore")
+            )
+        if "patch_tool_calls" not in disabled:
+            subagent_default_middleware.append(PatchToolCallsMiddleware())
+
+        deepagent_middleware.append(
+            SubAgentMiddleware(
+                default_model=model,
+                default_tools=tools,
+                subagents=subagents if subagents is not None else [],
+                default_middleware=subagent_default_middleware,
+                default_interrupt_on=interrupt_on,
+                general_purpose_agent=True,
+            )
+        )
+
+    if "summarization" not in disabled:
+        deepagent_middleware.append(
+            SummarizationMiddleware(
+                model=model,
+                max_tokens_before_summary=170000,
+                messages_to_keep=6,
+            )
+        )
+
+    if "prompt_caching" not in disabled:
+        deepagent_middleware.append(
+            AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore")
+        )
+
+    if "patch_tool_calls" not in disabled:
+        deepagent_middleware.append(PatchToolCallsMiddleware())
     if middleware:
         deepagent_middleware.extend(middleware)
     if interrupt_on is not None:
